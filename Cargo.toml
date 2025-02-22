@@ -1,0 +1,23 @@
+[package]
+name = "sinex"
+version = "0.2.4"
+license = "MPL-2.0"
+authors = ["Guillaume W. Bres <guillaume.bressaix@gmail.com>"]
+description = "SINEX format parser"
+homepage = "https://github.com/rtk-rs"
+repository = "https://github.com/rtk-rs/sinex"
+keywords = ["geo", "gnss", "gps"]
+categories = ["science", "science::geo", "parsing"]
+edition = "2021"
+readme = "README.md"
+
+[features]
+
+[build-dependencies]
+
+[dependencies]
+chrono = "0.4"
+thiserror = "1"
+strum_macros = "0.26"
+strum = { version = "0.26", features = ["derive"] }
+gnss-rs = { version = "2.3.1", features = ["serde"] }
