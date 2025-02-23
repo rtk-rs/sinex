@@ -1,38 +1,55 @@
-//! SINEX (Bias Solutions) file parser
-#![doc(html_logo_url = "https://raw.githubusercontent.com/rtk-rs/.github/master/logos/logo2.jpg")]
+#![doc(html_logo_url = "https://raw.githubusercontent.com/georust/meta/master/logo/logo.png")]
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![allow(clippy::type_complexity)]
 
 /*
- * SINEX is part of the rtk-rs framework.
+ * SINEX is part of the Geo-Rust framework.
  * Authors: Guillaume W. Bres <guillaume.bressaix@gmail.com> et al.
- * (cf. https://github.com/rtk-rs/sinex/graphs/contributors)
- * This framework is shipped under Mozilla Public V2 license.
+ * (cf. https://github.com/georust/rinex/graphs/contributors)
+ * This framework is shipped under both Apache-2.0 and MIT License.
  *
- * Documentation: https://github.com/rtk-rs/sinex
+ * Documentation: https://github.com/georust/rinex
  */
-
-use std::collections::HashMap;
-use std::io::{prelude::*, BufReader};
-use std::str::FromStr;
-use thiserror::Error;
 
 mod description;
 mod reference;
 
 pub mod bias;
 pub mod datetime;
+pub mod error;
 pub mod header;
 pub mod receiver;
 //pub mod troposphere;
 
 extern crate gnss_rs as gnss;
 
-use description::Description;
-use header::{is_valid_header, Header};
-use reference::Reference;
+use crate::{
+    bias::{
+        description::Description as BiasDescription, header::BiasMode, DeterminationMethod,
+        Solution as BiasSolution, TimeSystem,
+    },
+    description::Description,
+    error::ParsingError,
+    header::{is_valid_header, Header},
+    reference::Reference,
+};
+
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufRead, BufReader, Read},
+    path::Path,
+    str::FromStr,
+};
 
 use gnss::constellation::Constellation;
+use hifitime::prelude::Epoch;
+
+#[cfg(feature = "flate2")]
+use flate2::{read::GzDecoder, write::GzEncoder, Compression as GzCompression};
+
+pub type BiasSolutions = Vec<BiasSolution>;
 
 fn is_comment(line: &str) -> bool {
     line.starts_with('*')
@@ -58,41 +75,31 @@ fn is_dotdotdot(line: &str) -> bool {
     line.eq("...")
 }
 
-#[derive(Debug, Error)]
-pub enum Error {
-    /// SINEX file should start with proper header
-    #[error("missing header delimiter")]
-    MissingHeader,
-    /// Failed to parse Header section
-    #[error("invalid header content")]
-    InvalidHeader,
-    /// Closing incorrect section or structure is not correct
-    #[error("faulty file structure")]
-    FaultySection,
-    /// Unknown section / category
-    #[error("unknown type of section")]
-    UnknownSection(String),
-    /// Failed to open given file
-    #[error("failed to open given file")]
-    FileError(#[from] std::io::Error),
-    /// Failed to parse integer number
-    #[error("failed to parse integer number")]
-    ParseIntError(#[from] std::num::ParseIntError),
-    /// Failed to parse Bias Mode
-    #[error("failed to parse bias mode")]
-    ParseBiasModeError(#[from] bias::header::BiasModeError),
-    /// Failed to parse Determination Method
-    #[error("failed to parse determination method")]
-    ParseMethodError(#[from] bias::DeterminationMethodError),
-    /// Failed to parse time system field
-    #[error("failed to parse time system")]
-    ParseTimeSystemError(#[from] bias::TimeSystemError),
+/// Utility function to parse an [Epoch] from standardized SINEX format.
+pub(crate) fn parse_epoch(content: &str) -> Result<Epoch, ParsingError> {
+    if content.len() < 9 {
+        ParsingError::EpochFormat;
+    }
+
+    let ym = &content[0..8]; // "YYYY:DDD"
+    let dt = chrono::NaiveDate::parse_from_str(ym, "%Y:%j")?;
+    let secs = &content[9..];
+    let secs = f32::from_str(secs)?;
+    let h = secs / 3600.0;
+    let m = (secs - h * 3600.0) / 60.0;
+    let s = secs - h * 3600.0 - m * 60.0;
+    Ok(dt.and_hms(h as u32, m as u32, s as u32))
+}
+
+pub mod prelude {
+    pub use gnss::prelude::Constellation;
+    pub use hifitime::prelude::Epoch;
 }
 
 #[derive(Debug, Clone)]
 pub enum Record {
     /// Bias (BIA) record case
-    BiasSolutions(Vec<bias::Solution>),
+    BiasSolutions(BiasSolutions),
     // /// Troposphere (TRO) record case
     // TropoRecord(troposphere::Record),
     // /// SINEX (SNX) record case
@@ -101,51 +108,42 @@ pub enum Record {
 
 impl Record {
     /// Unwraps Bias Solutions, if feasible
-    pub fn bias_solutions(&self) -> Option<&Vec<bias::Solution>> {
+    pub fn bias_solutions(&self) -> Option<&BiasSolutions> {
         match self {
-            Self::BiasSolutions(r) => Some(r),
+            Self::BiasSolutions(v) => Some(v),
         }
     }
-    /*
-        /// Unwraps Troposphere Record, if feasible,
-        /// is [troposphere::Record] definition for more detail
-        pub fn tropo_record (&self) -> Option<&troposphere::Record> {
-            match self {
-                Self::TropoRecord(r) => Some(r),
-                _ => None,
-            }
-        }
-    */
 }
 
 #[derive(Debug, Clone)]
 pub struct Sinex {
-    /// Header section, is Document Type dependent
+    /// [Header] is type dependent. Stores high level
+    /// information.
     pub header: Header,
-    /// File Reference section
+    /// File [Reference] section.
     pub reference: Reference,
     /// Possible `Input` Acknowledgemet, especially for data providers
     pub acknowledgments: Vec<String>,
-    /// Possible `File Comments`
-    pub comments: Vec<String>,
-    /// File Description is Document Type dependent
+    /// File [Description] is type dependent
     pub description: Description,
-    /// Record
+    /// [Record] stores the file content
     pub record: Record,
+    /// Possible comments, stored as is.
+    pub comments: Vec<String>,
 }
 
 impl Sinex {
-    pub fn from_file(file: &str) -> Result<Self, Error> {
-        let file = std::fs::File::open(file)?;
-        let reader = BufReader::new(file);
+    /// Parse [Sinex] from readable I/O.
+    pub fn parse<R: Read>(reader: &mut BufReader<R>) -> Result<Self, ParsingError> {
         let mut is_first = true;
         let mut header = Header::default();
         let mut reference: Reference = Reference::default();
         let mut section = String::new();
         let mut comments: Vec<String> = Vec::new();
         let mut acknowledgments: Vec<String> = Vec::new();
-        let mut bias_description = bias::description::Description::default();
-        let mut bias_solutions: Vec<bias::Solution> = Vec::new();
+        let mut bias_description = BiasDescription::default();
+        let mut bias_solutions = BiasSolutions::with_capacity(16);
+
         //let mut trop_description = troposphere::Description::default();
         //let mut trop_coordinates : Vec<troposphere::Coordinates> = Vec::new();
         for line in reader.lines() {
@@ -158,7 +156,7 @@ impl Sinex {
             }
             if is_first {
                 if !is_valid_header(line) {
-                    return Err(Error::MissingHeader);
+                    return Err(ParsingError::MissingHeader);
                 }
                 if let Ok(hd) = Header::from_str(line) {
                     header = hd.clone()
@@ -171,7 +169,7 @@ impl Sinex {
                 section = s.clone();
             } else if let Some(s) = section_end(line) {
                 if !s.eq(&section) {
-                    return Err(Error::FaultySection);
+                    return Err(ParsingError::FaultySection);
                 }
             } else if is_valid_header(line) {
                 break; // EOF
@@ -186,9 +184,9 @@ impl Sinex {
                             "SOFTWARE" => reference = reference.with_software(content.trim()),
                             "HARDWARE" => reference = reference.with_hardware(content.trim()),
                             "CONTACT" => reference = reference.with_contact(content.trim()),
-                            _ => {}
+                            _ => {},
                         }
-                    }
+                    },
                     "FILE/COMMENT" => comments.push(line.trim().to_string()),
                     "INPUT/ACKNOWLEDGMENTS" => acknowledgments.push(line.trim().to_string()),
                     "BIAS/DESCRIPTION" => {
@@ -197,28 +195,28 @@ impl Sinex {
                             "OBSERVATION_SAMPLING" => {
                                 let sampling = u32::from_str_radix(content.trim(), 10)?;
                                 bias_description = bias_description.with_sampling(sampling)
-                            }
+                            },
                             "PARAMETER_SPACING" => {
                                 let spacing = u32::from_str_radix(content.trim(), 10)?;
                                 bias_description = bias_description.with_spacing(spacing)
-                            }
+                            },
                             "DETERMINATION_METHOD" => {
-                                let method = bias::DeterminationMethod::from_str(content.trim())?;
+                                let method = DeterminationMethod::from_str(content.trim())?;
                                 bias_description = bias_description.with_method(method)
-                            }
+                            },
                             "BIAS_MODE" => {
-                                let mode = bias::header::BiasMode::from_str(content.trim())?;
+                                let mode = BiasMode::from_str(content.trim())?;
                                 bias_description = bias_description.with_bias_mode(mode)
-                            }
+                            },
                             "TIME_SYSTEM" => {
-                                let system = bias::TimeSystem::from_str(content.trim())?;
+                                let system = TimeSystem::from_str(content.trim())?;
                                 bias_description = bias_description.with_time_system(system)
-                            }
+                            },
                             "RECEIVER_CLOCK_REFERENCE_GNSS" => {
                                 if let Ok(c) = Constellation::from_str(content.trim()) {
                                     bias_description = bias_description.with_rcvr_clock_ref(c)
                                 }
-                            }
+                            },
                             "SATELLITE_CLOCK_REFERENCE_OBSERVABLES" => {
                                 let items: Vec<&str> =
                                     content.trim().split_ascii_whitespace().collect();
@@ -236,10 +234,10 @@ impl Sinex {
                                         }
                                     }
                                 }
-                            }
-                            _ => {}
+                            },
+                            _ => {},
                         }
-                    }
+                    },
                     /*
                     "TROP/DESCRIPTION" => {
                         let (descriptor, content) = line.split_at(41);
@@ -282,14 +280,14 @@ impl Sinex {
                         if let Ok(sol) = bias::Solution::from_str(line.trim()) {
                             bias_solutions.push(sol)
                         }
-                    }
+                    },
                     /*
                     "TROP/STA_COORDINATES" => {
                         if let Ok(coords) = troposphere::Coordinates::from_str(line.trim()) {
                             trop_coordinates.push(coords)
                         }
                     },*/
-                    _ => return Err(Error::UnknownSection(section)),
+                    _ => return Err(ParsingError::UnknownSection(section)),
                 }
             }
         }
@@ -302,5 +300,48 @@ impl Sinex {
             description: Description::BiasDescription(bias_description),
             record: Record::BiasSolutions(bias_solutions),
         })
+    }
+
+    /// Parse [Sinex] from local file
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ParsingError> {
+        let path = path.as_ref();
+
+        let file = File::open(path).unwrap_or_else(|e| panic!("Failed to open file: {}", e));
+
+        let mut reader = BufReader::new(file);
+        Self::parse(&mut reader)
+    }
+
+    /// Parse [Sinex] from local gzip compressed file
+    #[cfg(feature = "flate2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "flate2")))]
+    pub fn from_gzip_file<P: AsRef<Path>>(path: P) -> Result<Self, ParsingError> {
+        let path = path.as_ref();
+
+        let file = File::open(path).unwrap_or_else(|e| panic!("Failed to open file: {}", e));
+
+        let reader = GzDecoder::new(fd);
+        let mut reader = BufReader::new(reader);
+        Self::parse(&mut reader)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{parse_epoch, ParsingError};
+
+    #[test]
+    fn epoch_parsing() {
+        match parse_epoch("2022:02") {
+            Ok(_) => panic!("epoch parsing should have failed!"),
+            Err(e) => match e {
+                ParsingError::EpochFormat => {},
+                e => panic!("parser returned invalid error: {}", e),
+            },
+        }
+
+        let _ = parse_epoch("2022:021:20823").unwrap();
+
+        let _ = parse_epoch("2022:009:00000").unwrap();
     }
 }
