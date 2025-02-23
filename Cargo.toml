@@ -10,6 +10,9 @@ keywords = ["geo", "gnss", "gps"]
 categories = ["science", "science::geo", "parsing"]
 edition = "2021"
 readme = "README.md"
+exclude = [
+    "data/*",
+]
 
 [features]
 
